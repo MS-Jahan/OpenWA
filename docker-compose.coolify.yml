@@ -1,0 +1,266 @@
+# OpenWA - Coolify deployment compose
+# =============================================================================
+# Optimized for one-click hosting on Coolify (https://coolify.io).
+#
+# What is different from docker-compose.yml (the manual-VPS reference):
+#   * No host port publishing. Coolify's built-in proxy (Traefik/Caddy) routes
+#     to the container over the shared proxy network using the INTERNAL port,
+#     so we only `expose: 2785` and let Coolify assign a domain + automatic
+#     HTTPS via the SERVICE_FQDN_OPENWA_2785 magic variable.
+#   * No `container_name:` — Coolify scopes container names per-deployment, and
+#     hardcoded names collide across redeploys / multiple instances. The app's
+#     orchestration matches by the `com.openwa.service` label, not the name.
+#   * No bind mounts. The `./docker-compose.yml` mount in the manual file is
+#     vestigial (the app never reads it — orchestration is done via the Docker
+#     API), and relative bind mounts resolve unreliably under Coolify. Named
+#     volumes are used throughout so Coolify persists them automatically.
+#   * Secrets use Coolify "magic" variables (SERVICE_PASSWORD_*) so Coolify
+#     generates and stores them for you instead of you typing them in.
+#
+# Default deploy = single container (openwa-api) + the docker socket proxy,
+# using SQLite. To enable the bundled datastores, set COMPOSE_PROFILES in the
+# Coolify environment, e.g. `postgres,redis` or `full`. Alternatively attach a
+# Coolify-managed Postgres/Redis and point DATABASE_*/REDIS_* at it.
+#
+# NOTE: Do NOT set POSTGRES_BUILTIN/REDIS_BUILTIN/MINIO_BUILTIN=true on Coolify.
+# Those flags make the app self-orchestrate datastores with insecure hardcoded
+# credentials; on Coolify use the profile-gated services below (managed secrets)
+# or an external Coolify database instead.
+# =============================================================================
+
+services:
+  # ===== CORE: Docker Socket Proxy (sole container with docker.sock access) =====
+  # Verified: with the env grants below the proxy permits exactly the orchestration
+  # calls the app makes (ping/info/list/volume-create/image-pull/container
+  # create+start+stop+remove) and denies everything else (networks/secrets -> 403).
+  docker-proxy:
+    image: tecnativa/docker-socket-proxy
+    restart: unless-stopped
+    networks:
+      - internal-docker
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      CONTAINERS: 1
+      IMAGES: 1
+      VOLUMES: 1
+      INFO: 1
+      PING: 1
+      POST: 1
+      DELETE: 1
+    labels:
+      - 'com.openwa.service=docker-proxy'
+      - 'com.openwa.core=true'
+
+  # ===== CORE: OpenWA Backend API (+ bundled dashboard SPA) =====
+  openwa-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    # `openwa-network` is referenced by literal name in docker.service.ts when the
+    # app attaches orchestrated containers, so keep the name fixed. internal-docker
+    # is the isolated path to the socket proxy. Coolify additionally attaches this
+    # service to its proxy network for domain routing.
+    networks:
+      - openwa-network
+      - internal-docker
+    # Container hardening (mirrors docker-compose.yml). Chromium runs with
+    # --no-sandbox; the container is the confinement boundary.
+    security_opt:
+      - 'no-new-privileges:true'
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
+    read_only: true
+    tmpfs:
+      - /tmp
+    pids_limit: 512
+    mem_limit: ${OPENWA_MEM_LIMIT:-2g}
+    # No host ports — Coolify's proxy reaches 2785 over the shared network.
+    expose:
+      - '2785'
+    environment:
+      # --- Coolify magic: auto-assign a domain + HTTPS, routed to port 2785.
+      # Set the actual domain in the Coolify UI (or let it generate an sslip.io one).
+      - SERVICE_FQDN_OPENWA_2785=/
+      # Core
+      - NODE_ENV=${NODE_ENV:-production}
+      - HOME=/tmp
+      - XDG_CONFIG_HOME=/tmp/.config
+      - XDG_CACHE_HOME=/tmp/.cache
+      - PORT=2785
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      # CORS: in production the wildcard is refused. Default to the Coolify FQDN.
+      - CORS_ORIGINS=${CORS_ORIGINS:-$SERVICE_FQDN_OPENWA_2785}
+      # Database (SQLite by default; switch to postgres via COMPOSE_PROFILES=postgres)
+      - DATABASE_TYPE=${DATABASE_TYPE:-sqlite}
+      - DATABASE_NAME=${DATABASE_NAME:-/app/data/openwa.sqlite}
+      - DATABASE_HOST=${DATABASE_HOST:-postgres}
+      - DATABASE_PORT=${DATABASE_PORT:-5432}
+      - DATABASE_USERNAME=${DATABASE_USERNAME:-openwa}
+      # Coolify generates & stores this; the postgres service below reuses the same value.
+      - DATABASE_PASSWORD=${SERVICE_PASSWORD_POSTGRES:-}
+      - DATABASE_SYNCHRONIZE=${DATABASE_SYNCHRONIZE:-false}
+      # Engine
+      - ENGINE_TYPE=${ENGINE_TYPE:-whatsapp-web.js}
+      - SESSION_DATA_PATH=/app/data/sessions
+      - PUPPETEER_HEADLESS=${PUPPETEER_HEADLESS:-true}
+      - PUPPETEER_ARGS=${PUPPETEER_ARGS:---no-sandbox,--disable-setuid-sandbox,--disable-dev-shm-usage,--disable-gpu}
+      - WWEBJS_WEB_VERSION=${WWEBJS_WEB_VERSION:-}
+      - WWEBJS_WEB_VERSION_REMOTE_PATH=${WWEBJS_WEB_VERSION_REMOTE_PATH:-}
+      - WWEBJS_AUTH_TIMEOUT_MS=${WWEBJS_AUTH_TIMEOUT_MS:-}
+      # Storage (local by default; switch to minio via COMPOSE_PROFILES=minio)
+      - STORAGE_TYPE=${STORAGE_TYPE:-local}
+      - STORAGE_LOCAL_PATH=/app/data/media
+      - S3_ENDPOINT=${S3_ENDPOINT:-http://minio:9000}
+      - S3_ACCESS_KEY=${SERVICE_USER_MINIO:-}
+      - S3_SECRET_KEY=${SERVICE_PASSWORD_MINIO:-}
+      - S3_BUCKET=${S3_BUCKET:-openwa}
+      # Redis (enable via COMPOSE_PROFILES=redis and REDIS_ENABLED=true)
+      - REDIS_ENABLED=${REDIS_ENABLED:-false}
+      - REDIS_HOST=${REDIS_HOST:-redis}
+      - REDIS_PORT=${REDIS_PORT:-6379}
+      # Webhook
+      - WEBHOOK_TIMEOUT=${WEBHOOK_TIMEOUT:-10000}
+      - WEBHOOK_MAX_RETRIES=${WEBHOOK_MAX_RETRIES:-3}
+      - WEBHOOK_RETRY_DELAY=${WEBHOOK_RETRY_DELAY:-5000}
+      # Rate Limit
+      - RATE_LIMIT_TTL=${RATE_LIMIT_TTL:-60}
+      - RATE_LIMIT_MAX=${RATE_LIMIT_MAX:-100}
+      # Plugins
+      - PLUGINS_ENABLED=${PLUGINS_ENABLED:-true}
+      - PLUGINS_DIR=/app/data/plugins
+      # Security: Coolify generates a 64-char master key you can view in the UI.
+      # Leave SERVICE_PASSWORD_64_OPENWAKEY unset to let the app self-generate one
+      # (printed to logs / data/.api-key) instead.
+      - API_MASTER_KEY=${SERVICE_PASSWORD_64_OPENWAKEY:-}
+      # The app talks to Docker only via the socket proxy, never the raw socket.
+      - DOCKER_HOST=tcp://docker-proxy:2375
+    volumes:
+      - openwa-data:/app/data
+    depends_on:
+      docker-proxy:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+        required: false
+      redis:
+        condition: service_healthy
+        required: false
+    healthcheck:
+      test:
+        [
+          'CMD',
+          'node',
+          '-e',
+          "require('http').get('http://localhost:2785/api/health/ready', (r) => process.exit(r.statusCode === 200 ? 0 : 1))",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    labels:
+      - 'com.openwa.service=api'
+      - 'com.openwa.core=true'
+
+  # ===== OPTIONAL: PostgreSQL (enable with COMPOSE_PROFILES=postgres or full) =====
+  postgres:
+    image: postgres:16-alpine
+    profiles: ['postgres', 'full']
+    restart: unless-stopped
+    networks:
+      - openwa-network
+    security_opt:
+      - 'no-new-privileges:true'
+    environment:
+      POSTGRES_USER: ${DATABASE_USERNAME:-openwa}
+      # Same Coolify-managed secret the API reads.
+      POSTGRES_PASSWORD: ${SERVICE_PASSWORD_POSTGRES:-}
+      POSTGRES_DB: ${DATABASE_NAME:-openwa}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${DATABASE_USERNAME:-openwa}']
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    labels:
+      - 'com.openwa.service=database'
+      - 'com.openwa.builtin=true'
+
+  # ===== OPTIONAL: Redis (enable with COMPOSE_PROFILES=redis or full) =====
+  redis:
+    image: redis:7-alpine
+    profiles: ['redis', 'full']
+    restart: unless-stopped
+    networks:
+      - openwa-network
+    security_opt:
+      - 'no-new-privileges:true'
+    command: redis-server --appendonly yes
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    labels:
+      - 'com.openwa.service=cache'
+      - 'com.openwa.builtin=true'
+
+  # ===== OPTIONAL: MinIO S3 (enable with COMPOSE_PROFILES=minio or full) =====
+  minio:
+    image: minio/minio
+    profiles: ['minio', 'full']
+    restart: unless-stopped
+    networks:
+      - openwa-network
+    security_opt:
+      - 'no-new-privileges:true'
+    command: server /data --console-address ":9001"
+    # Expose only; add SERVICE_FQDN_MINIO_9001 in env to publish the console via Coolify.
+    expose:
+      - '9000'
+      - '9001'
+    environment:
+      # Coolify-generated root credentials, shared with the API's S3_* vars.
+      MINIO_ROOT_USER: ${SERVICE_USER_MINIO:-}
+      MINIO_ROOT_PASSWORD: ${SERVICE_PASSWORD_MINIO:-}
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ['CMD', 'curl', '-f', 'http://localhost:9000/minio/health/live']
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    labels:
+      - 'com.openwa.service=storage'
+      - 'com.openwa.builtin=true'
+
+volumes:
+  openwa-data:
+    driver: local
+  postgres-data:
+    driver: local
+  redis-data:
+    driver: local
+  minio-data:
+    driver: local
+
+networks:
+  # Application network — keep the literal name `openwa-network`: docker.service.ts
+  # attaches orchestrated containers to it by name and resolves peers via it.
+  openwa-network:
+    name: openwa-network
+  # Isolated network for the Docker socket proxy. internal: true = no external
+  # connectivity; only openwa-api joins it, so nothing else can reach the proxy.
+  internal-docker:
+    name: openwa-internal-docker
+    internal: true
