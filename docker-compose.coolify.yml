@@ -53,7 +53,11 @@ services:
       - 'com.openwa.core=true'
 
   # ===== CORE: OpenWA Backend API (+ bundled dashboard SPA) =====
-  openwa-api:
+  # Service is named `openwa` (no hyphen) so it matches the SERVICE_FQDN_OPENWA_*
+  # magic variable exactly. Coolify derives the magic-var name from the service
+  # name, and hyphenated names (openwa-api) produce invalid .env keys. The app's
+  # orchestration matches by the `com.openwa.service=api` label, not this name.
+  openwa:
     build:
       context: .
       dockerfile: Dockerfile
@@ -88,6 +92,9 @@ services:
     environment:
       # --- Coolify magic: auto-assign a domain + HTTPS, routed to port 2785.
       # Set the actual domain in the Coolify UI (or let it generate an sslip.io one).
+      # This is a plain assignment (the `/` is the route path) — it does NOT trigger
+      # the "variable is not set" warning. Coolify detects this KEY and sets up the
+      # proxy + TLS, and generates the matching SERVICE_FQDN_OPENWA / SERVICE_URL_OPENWA.
       - SERVICE_FQDN_OPENWA_2785=/
       # Core
       - NODE_ENV=${NODE_ENV:-production}
@@ -96,8 +103,11 @@ services:
       - XDG_CACHE_HOME=/tmp/.cache
       - PORT=2785
       - LOG_LEVEL=${LOG_LEVEL:-info}
-      # CORS: in production the wildcard is refused. Default to the Coolify FQDN.
-      - CORS_ORIGINS=${CORS_ORIGINS:-$SERVICE_FQDN_OPENWA_2785}
+      # CORS: in production the wildcard is refused. Defaults to the full https URL
+      # Coolify generates for this service (SERVICE_URL_OPENWA = scheme + host, no
+      # port). Both refs carry a `:-` default so compose never warns about an unset
+      # variable; override CORS_ORIGINS in the Coolify UI to add more origins.
+      - CORS_ORIGINS=${CORS_ORIGINS:-${SERVICE_URL_OPENWA:-}}
       # Database (SQLite by default; switch to postgres via COMPOSE_PROFILES=postgres)
       - DATABASE_TYPE=${DATABASE_TYPE:-sqlite}
       - DATABASE_NAME=${DATABASE_NAME:-/app/data/openwa.sqlite}
